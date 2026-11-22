@@ -1511,26 +1511,29 @@ export class VacuumDevice extends GenericDevice {
 
 export class LockDevice extends GenericDevice {
   createHAPAccessory(api: any) {
+    const readLockState = async () => {
+      const state = await this.getState()
+      if (state?.lockState === 'locked') {
+        return 1
+      }
+      if (state?.lockState === 'unlocked') {
+        return 0
+      }
+      return state?.locked === true
+        ? 1
+        : 0
+    }
+
     return {
       services: [
         {
           type: 'LockMechanism',
           characteristics: {
             LockCurrentState: {
-              get: async () => {
-                const s = await this.getState()
-                return s && s.locked
-                  ? 1
-                  : 0
-              },
+              get: readLockState,
             },
             LockTargetState: {
-              get: async () => {
-                const s = await this.getState()
-                return s && s.locked
-                  ? 1
-                  : 0
-              },
+              get: readLockState,
               set: async (v: any) => {
                 await this.setState({ locked: !!v })
               },
