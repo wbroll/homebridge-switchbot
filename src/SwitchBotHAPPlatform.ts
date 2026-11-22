@@ -323,7 +323,7 @@ export class SwitchBotHAPPlatform {
               }
               if (getterSetter && typeof getterSetter.set === 'function') {
                 service.getCharacteristic(Characteristic).onSet(async (value: any) => {
-                  await getterSetter.set(value)
+                  const setResult = await getterSetter.set(value)
 
                   const refreshAfterSet = Array.isArray(getterSetter.refreshAfterSet) ? getterSetter.refreshAfterSet : []
                   // HAP stores the requested value after onSet resolves. Refresh on the next tick
@@ -344,7 +344,7 @@ export class SwitchBotHAPPlatform {
                       }
                       if (typeof getterSetter.afterSet === 'function') {
                         try {
-                          await getterSetter.afterSet(value, service, hap)
+                          await getterSetter.afterSet(value, service, hap, setResult)
                         } catch (e) {
                           this.log.debug?.(`Failed afterSet for ${charName}`, e)
                         }

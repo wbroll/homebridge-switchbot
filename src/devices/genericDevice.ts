@@ -206,8 +206,11 @@ export class GenericDevice extends DeviceBase {
     if (this.stateInFlight) {
       return this.stateInFlight
     }
-    this.stateInFlight = this.fetchState()
+    const request = this.fetchState()
       .then((value) => {
+        if (this.stateInFlight !== request) {
+          return this.getState()
+        }
         if (value === GenericDevice.UNREADABLE) {
           // Do not cache a failure. Caching it would hold every characteristic
           // at its fallback for the whole window after one transient error.
@@ -220,9 +223,23 @@ export class GenericDevice extends DeviceBase {
         return value
       })
       .finally(() => {
-        this.stateInFlight = undefined
+        if (this.stateInFlight === request) {
+          this.stateInFlight = undefined
+        }
       })
-    return this.stateInFlight
+    this.stateInFlight = request
+    return request
+  }
+
+  protected replaceCachedState(value?: any): void {
+    // An older request must neither repopulate the cache nor return its stale reading.
+    this.stateInFlight = undefined
+    this.stateCache = value === undefined
+      ? undefined
+      : {
+          at: Date.now(),
+          value,
+        }
   }
 
   protected async fetchState(): Promise<any> {
@@ -1511,8 +1528,12 @@ export class VacuumDevice extends GenericDevice {
 
 export class LockDevice extends GenericDevice {
   createHAPAccessory(api: any) {
-    const readLockState = async () => {
-      const state = await this.getState()
+    const deviceType = String(this.opts.deviceType ?? this.opts.type).toLowerCase()
+    const bleEnabled = this.cfg.nodeClientConfig?.enableBLE ?? this.cfg.enableBLE
+    const refreshAfterCommand = bleEnabled === false && (deviceType === 'smart lock' || deviceType === 'lock')
+    let pending: { target: number } | undefined
+
+    const lockStateValue = (state: any) => {
       if (state?.lockState === 'locked') {
         return 1
       }
@@ -1524,6 +1545,8 @@ export class LockDevice extends GenericDevice {
         : 0
     }
 
+    const readLockState = async () => lockStateValue(await this.getState())
+
     return {
       services: [
         {
@@ -1533,10 +1556,80 @@ export class LockDevice extends GenericDevice {
               get: readLockState,
             },
             LockTargetState: {
-              get: readLockState,
+              get: refreshAfterCommand
+                ? async () => {
+                  const current = pending
+                    ? pending.target
+                    : await readLockState()
+                  return pending?.target ?? current
+                }
+                : readLockState,
               set: async (v: any) => {
-                await this.setState({ locked: !!v })
+                if (!refreshAfterCommand) {
+                  await this.setState({ locked: !!v })
+                  return
+                }
+
+                const command = {
+                  target: v ? 1 : 0,
+                }
+                pending = command
+                try {
+                  const result = await this.setState({ locked: !!v })
+                  if (pending !== command) {
+                    throw new Error('Lock command superseded')
+                  }
+                  if (result !== true && result?.success !== true) {
+                    throw new Error('Lock command failed')
+                  }
+                  return command
+                } catch (error) {
+                  if (pending === command) {
+                    pending = undefined
+                  }
+                  throw error
+                }
               },
+              ...(refreshAfterCommand && {
+                afterSet: async (_value: number, service: any, hap: any, command: { target: number }) => {
+                  const resumePolling = () => {
+                    if (pending === command) {
+                      this.replaceCachedState()
+                      pending = undefined
+                    }
+                  }
+                  // Release the pending target even if a cloud request is slow.
+                  const deadline = setTimeout(resumePolling, 10_000)
+                  try {
+                    // Allow the motor and hub time to report the new position.
+                    for (const delay of [2000, 4000]) {
+                      await new Promise(resolve => setTimeout(resolve, delay))
+                      if (pending !== command) {
+                        return
+                      }
+                      const state = await this.fetchState()
+                      if (pending !== command) {
+                        return
+                      }
+                      if (state === GenericDevice.UNREADABLE) {
+                        return
+                      }
+                      const known = state?.lockState === 'locked' || state?.lockState === 'unlocked'
+                        || typeof state?.locked === 'boolean'
+                      if (known && lockStateValue(state) === command.target) {
+                        this.replaceCachedState(state)
+                        pending = undefined
+                        service.getCharacteristic(hap.Characteristic.LockCurrentState).updateValue(command.target)
+                        service.getCharacteristic(hap.Characteristic.LockTargetState).updateValue(command.target)
+                        return
+                      }
+                    }
+                  } finally {
+                    clearTimeout(deadline)
+                    resumePolling()
+                  }
+                },
+              }),
             },
           },
         },
