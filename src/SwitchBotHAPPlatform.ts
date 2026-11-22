@@ -1,10 +1,21 @@
 import type { SwitchBotPluginConfig } from './settings.js'
 import type { API, Logger, PlatformConfig } from 'homebridge'
 
+import { normalizeLockMac, parseClassicLockWebhookConfig, startClassicLockWebhook } from './classicLockWebhook.js'
 import { createDevice } from './deviceFactory.js'
 import { PLATFORM_NAME, PLUGIN_NAME } from './settings.js'
 import { SwitchBotClient } from './switchbotClient.js'
 import { normalizeTypeForMatter } from './utils.js'
+
+interface WebhookLockTarget {
+  id: string
+  verify: (
+    read: () => Promise<unknown>,
+    isCurrent: () => boolean,
+    publish: (current: number, target: number | undefined) => void,
+  ) => Promise<void>
+  publish: (current: number, target: number | undefined) => void
+}
 
 type PublishHapValue = (value: number | undefined) => void
 type ReadHapValue = (publish: PublishHapValue) => Promise<void>
@@ -48,6 +59,10 @@ export class SwitchBotHAPPlatform {
   /** Readable characteristics per device id, so a poll can push new values */
   private hapPushTargets: Map<string, { device: any, entries: Array<{ service: any, characteristic: any, get: () => Promise<any>, readForHap?: ReadHapValue }> }> = new Map()
 
+  private webhookTargets = new Map<string, WebhookLockTarget>()
+  private webhookListener?: ReturnType<typeof startClassicLockWebhook>
+  private webhookStopped = false
+
   /** Timers for per-device OpenAPI polling */
   private openApiPollTimers: Map<string, NodeJS.Timeout> = new Map()
   /** Timer for batched OpenAPI polling */
@@ -81,20 +96,20 @@ export class SwitchBotHAPPlatform {
     }
 
     // Wait for Homebridge to finish launching to create/register accessories
-    if (this.api && typeof (this.api as any).on === 'function') {
-      (this.api as any).on('didFinishLaunching', async () => {
+    const bridgeApi = this.api
+    if (bridgeApi && typeof bridgeApi.on === 'function') {
+      bridgeApi.on('shutdown', () => this.shutdown())
+      bridgeApi.on('didFinishLaunching', async () => {
         await this.loadDevices()
+        if (this.webhookStopped) {
+          return
+        }
+        this.startWebhookListener()
         this._setupOpenApiPolling()
         // Start periodic config reload to pick up UI changes
         this.configReloadInterval = setInterval(() => {
           void this.checkAndReloadDevices()
         }, 10000) // Check every 10 seconds
-        // Listen for Homebridge shutdown to clear interval
-        if (typeof (this.api as any).on === 'function') {
-          (this.api as any).on('shutdown', () => {
-            this.shutdown()
-          })
-        }
       })
     } else {
       void this.loadDevices()
@@ -204,6 +219,8 @@ export class SwitchBotHAPPlatform {
       return
     }
     const hap = (this.api as any).hap
+    const webhookTargets = new Map<string, WebhookLockTarget>()
+    const duplicateIds = new Set<string>()
     const accessoriesToRegister: any[] = []
     for (const { created, d, type } of createdDevices) {
       try {
@@ -295,6 +312,22 @@ export class SwitchBotHAPPlatform {
               continue
             }
             const service = accessory.getService(Service) || accessory.addService(Service)
+            const webhookId = normalizeLockMac(d.id)
+            if (s.type === 'LockMechanism' && webhookId && typeof accDesc.verifyWebhookStatus === 'function') {
+              if (webhookTargets.has(webhookId)) {
+                duplicateIds.add(webhookId)
+              }
+              webhookTargets.set(webhookId, {
+                id: d.id,
+                verify: accDesc.verifyWebhookStatus,
+                publish: (current, target) => {
+                  service.getCharacteristic(hap.Characteristic.LockCurrentState).updateValue(current)
+                  if (target !== undefined) {
+                    service.getCharacteristic(hap.Characteristic.LockTargetState).updateValue(target)
+                  }
+                },
+              })
+            }
             const characteristicUUIDs = new Set(
               Object.keys(s.characteristics || {})
                 .map(name => hap.Characteristic[name]?.UUID)
@@ -403,6 +436,10 @@ export class SwitchBotHAPPlatform {
     } else {
       this.log.info('No HAP accessories to register')
     }
+    for (const id of duplicateIds) {
+      webhookTargets.delete(id)
+    }
+    this.webhookTargets = webhookTargets
   }
 
   /**
@@ -482,12 +519,42 @@ export class SwitchBotHAPPlatform {
     }
   }
 
+  private startWebhookListener(): void {
+    if (this.config.classicLockWebhook?.enabled !== true || this.webhookListener || this.webhookStopped) {
+      return
+    }
+    const config = parseClassicLockWebhookConfig(this.config.classicLockWebhook)
+    const bleEnabled = this.config.nodeClientConfig?.enableBLE ?? this.config.enableBLE
+    if (!config || bleEnabled !== false || !this.config.openApiToken || !this.config.openApiSecret) {
+      this.log.warn('Classic Lock webhook disabled: invalid configuration or OpenAPI credentials missing')
+      return
+    }
+    this.webhookListener = startClassicLockWebhook(config, (id) => {
+      const target = this.webhookTargets.get(id)
+      const client = this.config._client as SwitchBotClient | undefined
+      if (!target || !client?.getClassicLockWebhookReader?.(target.id)) {
+        return
+      }
+      return async (signal, expiresAt) => {
+        const isCurrent = () => !signal.aborted && Date.now() < expiresAt
+          && !this.webhookStopped && this.webhookTargets.get(id) === target
+        const read = client.getClassicLockWebhookReader(target.id)
+        if (read && isCurrent()) {
+          await target.verify(() => read(signal), isCurrent, target.publish)
+        }
+      }
+    }, () => this.log.warn('Classic Lock webhook listener error'))
+  }
+
   /**
    * Cleanup method to clear config reload interval on shutdown.
    * Called by Homebridge on shutdown event.
    * @returns {void}
    */
   shutdown(): void {
+    this.webhookStopped = true
+    void this.webhookListener?.close()
+    this.webhookListener = undefined
     if (this.configReloadInterval) {
       clearInterval(this.configReloadInterval)
       this.configReloadInterval = null

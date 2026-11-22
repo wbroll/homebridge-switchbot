@@ -37,6 +37,7 @@ import type { SwitchBotPluginConfig } from '../settings.js'
 
 import { Buffer } from 'node:buffer'
 
+import { classicLockStatusReader, decodeClassicLockStatus, normalizeLockMac, parseClassicLockWebhookConfig } from '../classicLockWebhook.js'
 import { MATTER_ATTRIBUTE_IDS, MATTER_CLUSTER_IDS } from '../utils.js'
 import { DeviceBase } from './deviceBase.js'
 
@@ -1532,19 +1533,55 @@ interface LockCommand {
   expiresAt?: number
   confirmed?: number
   timers: NodeJS.Timeout[]
-  publish?: (current: number) => void
+  publish?: (current: number, target: number | undefined) => void
 }
 
 const LOCK_CONFIRMATION_WINDOW_MS = 20_000
 
 export class LockDevice extends GenericDevice {
+  private useRawLockStatus = false
+  private lockReads = 0
+  private readonly lockReadOrder = new WeakMap<object, number>()
+
+  private async readRawLockStatus(read: () => Promise<unknown>) {
+    const order = ++this.lockReads
+    const status = decodeClassicLockStatus(await read())
+    if (!status) {
+      return GenericDevice.UNREADABLE
+    }
+    this.lockReadOrder.set(status, order)
+    return status
+  }
+
+  protected async fetchState(): Promise<any> {
+    if (this.useRawLockStatus) {
+      try {
+        const device = await this.client?.getDevice(this.opts.id)
+        const read = classicLockStatusReader(device, this.opts.id)
+        if (read) {
+          return await this.readRawLockStatus(read)
+        }
+      } catch {
+        return GenericDevice.UNREADABLE
+      }
+    }
+    return super.fetchState()
+  }
+
   createHAPAccessory(api: any) {
     const deviceType = String(this.opts.deviceType ?? this.opts.type).toLowerCase()
     const bleEnabled = this.cfg.nodeClientConfig?.enableBLE ?? this.cfg.enableBLE
     const refreshAfterCommand = bleEnabled === false && (deviceType === 'smart lock' || deviceType === 'lock')
+    const webhookConfig = parseClassicLockWebhookConfig(this.cfg.classicLockWebhook)
+    const id = normalizeLockMac(this.opts.id)
+    const webhookEnabled = refreshAfterCommand && !!this.cfg.openApiToken && !!this.cfg.openApiSecret
+      && !!id && webhookConfig?.ids.has(id) === true
+    this.useRawLockStatus = webhookEnabled
     let commandId = 0
     let stateRevision = 0
+    let lastObservationOrder = 0
     let lastObserved: number | undefined
+    let lastBinary: number | undefined
     let command: LockCommand | undefined
 
     const lockStateValue = (state: any) => {
@@ -1560,8 +1597,32 @@ export class LockDevice extends GenericDevice {
     }
 
     const readLockState = async () => lockStateValue(await this.getState())
-    const knownLockState = (state: any) => state?.lockState === 'locked' || state?.lockState === 'unlocked'
-      || typeof state?.locked === 'boolean'
+    const observe = (state: any) => {
+      const order = this.lockReadOrder.get(state)
+      if (webhookEnabled && (order === undefined || order < lastObservationOrder)) {
+        return
+      }
+      if (state?.lockState === 'locked' || state?.lockState === 'unlocked' || typeof state?.locked === 'boolean') {
+        lastObserved = lastBinary = lockStateValue(state)
+      } else if (webhookEnabled && state?.lockState === 'jammed') {
+        lastObserved = 2
+      } else {
+        return
+      }
+      lastObservationOrder = order ?? lastObservationOrder
+      return lastObserved
+    }
+
+    const targetValue = () => command?.confirmed === undefined
+      ? command?.target ?? lastBinary
+      : lastBinary
+
+    const cacheObservation = (state: any) => {
+      // Do not detach a normal poll that started after this observation's GET.
+      if (!webhookEnabled || this.lockReadOrder.get(state) === this.lockReads) {
+        this.replaceCachedState(state)
+      }
+    }
 
     const finish = (active: LockCommand, reason: string) => {
       active.timers.forEach(timer => clearTimeout(timer))
@@ -1572,9 +1633,47 @@ export class LockDevice extends GenericDevice {
     const confirm = (active: LockCommand, state: any, observed: number, source: string) => {
       active.confirmed = observed
       stateRevision++
-      this.replaceCachedState(state)
+      cacheObservation(state)
       finish(active, `confirmed by ${source}; follow-up ended`)
-      active.publish?.(observed)
+      active.publish?.(observed, observed)
+    }
+
+    const observeAndConfirm = (state: any, source: string) => {
+      const observed = observe(state)
+      const active = command
+      if (observed !== undefined && active?.expiresAt !== undefined && active.confirmed === undefined
+        && Date.now() < active.expiresAt && observed === active.target) {
+        confirm(active, state, observed, source)
+      }
+      return observed
+    }
+
+    const verifyWebhookStatus = async (
+      read: () => Promise<unknown>,
+      isCurrent: () => boolean,
+      publish: (current: number, target: number | undefined) => void,
+    ) => {
+      const revision = stateRevision
+      const state = await this.readRawLockStatus(read)
+      if (!isCurrent() || revision !== stateRevision) {
+        return
+      }
+      const observed = observe(state)
+      if (observed === undefined) {
+        return
+      }
+      const active = command
+      if (active?.expiresAt !== undefined && active.confirmed === undefined
+        && Date.now() < active.expiresAt && observed === active.target) {
+        confirm(active, state, observed, 'webhook verification')
+        if (active.publish) {
+          return
+        }
+      } else {
+        stateRevision++
+        cacheObservation(state)
+      }
+      publish(observed, targetValue())
     }
 
     const readForHap = async (readTarget: boolean, publish: (value: number | undefined) => void) => {
@@ -1586,19 +1685,9 @@ export class LockDevice extends GenericDevice {
         if (revision !== stateRevision) {
           continue
         }
-        const active = command
-        if (knownLockState(state)) {
-          lastObserved = lockStateValue(state)
-          if (active?.expiresAt !== undefined && active.confirmed === undefined
-            && Date.now() < active.expiresAt && lastObserved === active.target) {
-            confirm(active, state, lastObserved, 'status read')
-          }
-        }
-        const pendingTarget = command?.confirmed === undefined
-          ? command?.target
-          : undefined
+        observeAndConfirm(state, 'status read')
         publish(readTarget
-          ? pendingTarget ?? lastObserved
+          ? targetValue()
           : lastObserved)
         return
       }
@@ -1649,14 +1738,14 @@ export class LockDevice extends GenericDevice {
       if (command !== active || expiresAt === undefined) {
         return
       }
-      active.publish = (value) => {
-        service.getCharacteristic(hap.Characteristic.LockCurrentState).updateValue(value)
-        if (command === undefined || command === active) {
-          service.getCharacteristic(hap.Characteristic.LockTargetState).updateValue(value)
+      active.publish = (current, target) => {
+        service.getCharacteristic(hap.Characteristic.LockCurrentState).updateValue(current)
+        if (target !== undefined && (command === undefined || command === active)) {
+          service.getCharacteristic(hap.Characteristic.LockTargetState).updateValue(target)
         }
       }
       if (active.confirmed !== undefined) {
-        active.publish(lastObserved ?? active.confirmed)
+        active.publish(lastObserved ?? active.confirmed, lastBinary ?? active.confirmed)
         return
       }
 
@@ -1671,12 +1760,7 @@ export class LockDevice extends GenericDevice {
           if (command !== active || active.confirmed !== undefined || Date.now() >= expiresAt) {
             return
           }
-          if (knownLockState(state)) {
-            lastObserved = lockStateValue(state)
-            if (lastObserved === active.target) {
-              confirm(active, state, lastObserved, 'follow-up')
-            }
-          }
+          observeAndConfirm(state, 'follow-up')
         }, Math.max(0, expiresIn - LOCK_CONFIRMATION_WINDOW_MS + delay)))
       }
       active.timers.push(setTimeout(() => {
@@ -1686,7 +1770,7 @@ export class LockDevice extends GenericDevice {
           this.replaceCachedState()
           finish(active, 'confirmation timed out; follow-up ended')
           if (lastObserved !== undefined) {
-            active.publish?.(lastObserved)
+            active.publish?.(lastObserved, lastBinary)
           }
         }
       }, Math.max(0, expiresIn)))
@@ -1700,6 +1784,7 @@ export class LockDevice extends GenericDevice {
     })
 
     return {
+      ...(webhookEnabled && { verifyWebhookStatus }),
       services: [
         {
           type: 'LockMechanism',

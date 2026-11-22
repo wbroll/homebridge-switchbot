@@ -1,7 +1,10 @@
+import type { ClassicLockWebhookConfig } from './classicLockWebhook.js'
+
 export const PLUGIN_NAME = '@switchbot/homebridge-switchbot'
 export const PLATFORM_NAME = 'SwitchBot'
 
 export interface SwitchBotPluginConfig {
+  classicLockWebhook?: ClassicLockWebhookConfig
   openApiToken?: string
   openApiSecret?: string
   preferMatter?: boolean

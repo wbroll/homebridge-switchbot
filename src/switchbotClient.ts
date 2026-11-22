@@ -1,6 +1,9 @@
 import type { SwitchBotPluginConfig } from './settings.js'
 import type { SwitchBot } from 'node-switchbot'
 
+import { createHmac, randomUUID } from 'node:crypto'
+
+import { classicLockStatusReader, normalizeLockMac } from './classicLockWebhook.js'
 import { getDeviceCommandHandler } from './deviceCommandMapper.js'
 import { CharacteristicMissingError, SwitchbotAuthenticationError, SwitchbotOperationError } from './errors.js'
 
@@ -290,6 +293,44 @@ export class SwitchBotClient implements ISwitchBotClient {
     }
 
     return 5000
+  }
+
+  getClassicLockWebhookReader(id: string): ((signal: AbortSignal) => Promise<unknown>) | undefined {
+    const api = this.client?.getConfig()
+    const origin = 'https://api.switch-bot.com'
+    const deviceId = normalizeLockMac(id)
+    if (!deviceId || !api?.token || !api.secret || (api.baseURL && api.baseURL.replace(/\/$/, '') !== origin)
+      || !classicLockStatusReader(this.getManagedDevice(id), id)) {
+      return
+    }
+    const { token, secret } = api
+    return async (signal) => {
+      // The SDK getLockInfo does not expose cancellation. Use a read-only, signed
+      // request so a superseded or timed-out verification releases its slot.
+      const t = String(Date.now())
+      const nonce = randomUUID()
+      const sign = createHmac('sha256', secret).update(token + t + nonce).digest('base64')
+      const response = await fetch(`${origin}/v1.1/devices/${deviceId}/status`, {
+        method: 'GET',
+        headers: { Authorization: token, t, nonce, sign },
+        redirect: 'error',
+        signal,
+      })
+      if (!response.ok) {
+        await response.body?.cancel()
+        return
+      }
+      const data = await response.json()
+      if (data?.statusCode !== 100 && data?.statusCode !== 200) {
+        return
+      }
+      const status = data.body
+      if ((status?.deviceId !== undefined && normalizeLockMac(status.deviceId) !== deviceId)
+        || (status?.deviceType !== undefined && status.deviceType !== 'Smart Lock')) {
+        return
+      }
+      return status
+    }
   }
 
   private getManagedDevice(id: string): any {
