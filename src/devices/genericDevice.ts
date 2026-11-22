@@ -1526,12 +1526,26 @@ export class VacuumDevice extends GenericDevice {
   }
 }
 
+interface LockCommand {
+  id: number
+  target: number
+  expiresAt?: number
+  confirmed?: number
+  timers: NodeJS.Timeout[]
+  publish?: (current: number) => void
+}
+
+const LOCK_CONFIRMATION_WINDOW_MS = 20_000
+
 export class LockDevice extends GenericDevice {
   createHAPAccessory(api: any) {
     const deviceType = String(this.opts.deviceType ?? this.opts.type).toLowerCase()
     const bleEnabled = this.cfg.nodeClientConfig?.enableBLE ?? this.cfg.enableBLE
     const refreshAfterCommand = bleEnabled === false && (deviceType === 'smart lock' || deviceType === 'lock')
-    let pending: { target: number } | undefined
+    let commandId = 0
+    let stateRevision = 0
+    let lastObserved: number | undefined
+    let command: LockCommand | undefined
 
     const lockStateValue = (state: any) => {
       if (state?.lockState === 'locked') {
@@ -1546,90 +1560,155 @@ export class LockDevice extends GenericDevice {
     }
 
     const readLockState = async () => lockStateValue(await this.getState())
+    const knownLockState = (state: any) => state?.lockState === 'locked' || state?.lockState === 'unlocked'
+      || typeof state?.locked === 'boolean'
+
+    const finish = (active: LockCommand, reason: string) => {
+      active.timers.forEach(timer => clearTimeout(timer))
+      active.timers.length = 0
+      this.log.debug(`[${this.opts.id}] Lock command ${active.id}: ${reason}`)
+    }
+
+    const confirm = (active: LockCommand, state: any, observed: number, source: string) => {
+      active.confirmed = observed
+      stateRevision++
+      this.replaceCachedState(state)
+      finish(active, `confirmed by ${source}; follow-up ended`)
+      active.publish?.(observed)
+    }
+
+    const readForHap = async (readTarget: boolean, publish: (value: number | undefined) => void) => {
+      // The revision check and the HAP write must happen in the same turn.
+      // Returning a plain Promise value to HAP leaves a gap after that check.
+      for (;;) {
+        const revision = stateRevision
+        const state = await this.getState()
+        if (revision !== stateRevision) {
+          continue
+        }
+        const active = command
+        if (knownLockState(state)) {
+          lastObserved = lockStateValue(state)
+          if (active?.expiresAt !== undefined && active.confirmed === undefined
+            && Date.now() < active.expiresAt && lastObserved === active.target) {
+            confirm(active, state, lastObserved, 'status read')
+          }
+        }
+        const pendingTarget = command?.confirmed === undefined
+          ? command?.target
+          : undefined
+        publish(readTarget
+          ? pendingTarget ?? lastObserved
+          : lastObserved)
+        return
+      }
+    }
+
+    const setTarget = async (value: number) => {
+      if (!refreshAfterCommand) {
+        await this.setState({ locked: !!value })
+        return
+      }
+
+      if (command && command.confirmed === undefined) {
+        finish(command, 'superseded; follow-up ended')
+      }
+      const active: LockCommand = {
+        id: ++commandId,
+        target: value ? 1 : 0,
+        timers: [],
+      }
+      command = active
+      stateRevision++
+      try {
+        const result = await this.setState({ locked: !!value })
+        if (command !== active) {
+          throw new Error('Lock command superseded')
+        }
+        if (result !== true && result?.success !== true) {
+          throw new Error('Lock command failed')
+        }
+        // Only reads started after the successful write can confirm it.
+        stateRevision++
+        active.expiresAt = Date.now() + LOCK_CONFIRMATION_WINDOW_MS
+        this.replaceCachedState()
+        this.log.debug(`[${this.opts.id}] Lock command ${active.id}: follow-up started for target ${active.target}`)
+        return active
+      } catch (error) {
+        if (command === active) {
+          command = undefined
+          stateRevision++
+          finish(active, 'write failed; follow-up ended')
+        }
+        throw error
+      }
+    }
+
+    const afterSet = (_value: number, service: any, hap: any, active: LockCommand) => {
+      const expiresAt = active.expiresAt
+      if (command !== active || expiresAt === undefined) {
+        return
+      }
+      active.publish = (value) => {
+        service.getCharacteristic(hap.Characteristic.LockCurrentState).updateValue(value)
+        if (command === undefined || command === active) {
+          service.getCharacteristic(hap.Characteristic.LockTargetState).updateValue(value)
+        }
+      }
+      if (active.confirmed !== undefined) {
+        active.publish(lastObserved ?? active.confirmed)
+        return
+      }
+
+      const expiresIn = expiresAt - Date.now()
+      for (const delay of [2000, 6000, 16_000]) {
+        active.timers.push(setTimeout(async () => {
+          if (command !== active || active.confirmed !== undefined || Date.now() >= expiresAt) {
+            return
+          }
+          this.log.debug(`[${this.opts.id}] Lock command ${active.id}: requesting status at +${delay} ms`)
+          const state = await this.fetchState()
+          if (command !== active || active.confirmed !== undefined || Date.now() >= expiresAt) {
+            return
+          }
+          if (knownLockState(state)) {
+            lastObserved = lockStateValue(state)
+            if (lastObserved === active.target) {
+              confirm(active, state, lastObserved, 'follow-up')
+            }
+          }
+        }, Math.max(0, expiresIn - LOCK_CONFIRMATION_WINDOW_MS + delay)))
+      }
+      active.timers.push(setTimeout(() => {
+        if (command === active && active.confirmed === undefined) {
+          command = undefined
+          stateRevision++
+          this.replaceCachedState()
+          finish(active, 'confirmation timed out; follow-up ended')
+          if (lastObserved !== undefined) {
+            active.publish?.(lastObserved)
+          }
+        }
+      }, Math.max(0, expiresIn)))
+    }
+
+    const lockGetter = (readTarget: boolean) => ({
+      get: readLockState,
+      ...(refreshAfterCommand && {
+        readForHap: (publish: (value: number | undefined) => void) => readForHap(readTarget, publish),
+      }),
+    })
 
     return {
       services: [
         {
           type: 'LockMechanism',
           characteristics: {
-            LockCurrentState: {
-              get: readLockState,
-            },
+            LockCurrentState: lockGetter(false),
             LockTargetState: {
-              get: refreshAfterCommand
-                ? async () => {
-                  const current = pending
-                    ? pending.target
-                    : await readLockState()
-                  return pending?.target ?? current
-                }
-                : readLockState,
-              set: async (v: any) => {
-                if (!refreshAfterCommand) {
-                  await this.setState({ locked: !!v })
-                  return
-                }
-
-                const command = {
-                  target: v ? 1 : 0,
-                }
-                pending = command
-                try {
-                  const result = await this.setState({ locked: !!v })
-                  if (pending !== command) {
-                    throw new Error('Lock command superseded')
-                  }
-                  if (result !== true && result?.success !== true) {
-                    throw new Error('Lock command failed')
-                  }
-                  return command
-                } catch (error) {
-                  if (pending === command) {
-                    pending = undefined
-                  }
-                  throw error
-                }
-              },
-              ...(refreshAfterCommand && {
-                afterSet: async (_value: number, service: any, hap: any, command: { target: number }) => {
-                  const resumePolling = () => {
-                    if (pending === command) {
-                      this.replaceCachedState()
-                      pending = undefined
-                    }
-                  }
-                  // Release the pending target even if a cloud request is slow.
-                  const deadline = setTimeout(resumePolling, 10_000)
-                  try {
-                    // Allow the motor and hub time to report the new position.
-                    for (const delay of [2000, 4000]) {
-                      await new Promise(resolve => setTimeout(resolve, delay))
-                      if (pending !== command) {
-                        return
-                      }
-                      const state = await this.fetchState()
-                      if (pending !== command) {
-                        return
-                      }
-                      if (state === GenericDevice.UNREADABLE) {
-                        return
-                      }
-                      const known = state?.lockState === 'locked' || state?.lockState === 'unlocked'
-                        || typeof state?.locked === 'boolean'
-                      if (known && lockStateValue(state) === command.target) {
-                        this.replaceCachedState(state)
-                        pending = undefined
-                        service.getCharacteristic(hap.Characteristic.LockCurrentState).updateValue(command.target)
-                        service.getCharacteristic(hap.Characteristic.LockTargetState).updateValue(command.target)
-                        return
-                      }
-                    }
-                  } finally {
-                    clearTimeout(deadline)
-                    resumePolling()
-                  }
-                },
-              }),
+              ...lockGetter(true),
+              set: setTarget,
+              ...(refreshAfterCommand && { afterSet }),
             },
           },
         },

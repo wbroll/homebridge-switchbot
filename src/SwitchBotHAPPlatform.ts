@@ -6,6 +6,10 @@ import { PLATFORM_NAME, PLUGIN_NAME } from './settings.js'
 import { SwitchBotClient } from './switchbotClient.js'
 import { normalizeTypeForMatter } from './utils.js'
 
+type PublishHapValue = (value: number | undefined) => void
+type ReadHapValue = (publish: PublishHapValue) => Promise<void>
+const hapReadListeners = new WeakMap<object, (callback: (error: Error | null, value?: number) => void) => void>()
+
 /**
  * Homebridge platform class for SwitchBot HAP (HomeKit Accessory Protocol) integration.
  * Handles device discovery, registration, polling, and accessory lifecycle for HAP-enabled SwitchBot devices.
@@ -42,7 +46,7 @@ export class SwitchBotHAPPlatform {
   /** Interval for periodic config reload */
   private configReloadInterval: NodeJS.Timeout | null = null
   /** Readable characteristics per device id, so a poll can push new values */
-  private hapPushTargets: Map<string, { device: any, entries: Array<{ service: any, characteristic: any, get: () => Promise<any> }> }> = new Map()
+  private hapPushTargets: Map<string, { device: any, entries: Array<{ service: any, characteristic: any, get: () => Promise<any>, readForHap?: ReadHapValue }> }> = new Map()
 
   /** Timers for per-device OpenAPI polling */
   private openApiPollTimers: Map<string, NodeJS.Timeout> = new Map()
@@ -315,10 +319,38 @@ export class SwitchBotHAPPlatform {
                 }
               }
               if (getterSetter && typeof getterSetter.get === 'function') {
-                service.getCharacteristic(Characteristic).onGet(getterSetter.get)
+                const characteristic = service.getCharacteristic(Characteristic)
+                const previous = hapReadListeners.get(characteristic)
+                if (previous) {
+                  characteristic.removeListener('get', previous)
+                  hapReadListeners.delete(characteristic)
+                }
+                const readForHap: ReadHapValue | undefined = getterSetter.readForHap
+                if (readForHap) {
+                  // HAP's callback applies the value synchronously, without an await after validation.
+                  characteristic.removeOnGet()
+                  const listener = (callback: (error: Error | null, value?: number) => void) => {
+                    void readForHap((value) => {
+                      if (value === undefined) {
+                        callback(new Error('Lock state unavailable'))
+                      } else {
+                        callback(null, value)
+                      }
+                    }).catch(callback)
+                  }
+                  characteristic.on('get', listener)
+                  hapReadListeners.set(characteristic, listener)
+                } else {
+                  characteristic.onGet(getterSetter.get)
+                }
                 // Remember it so a poll can push the new value.
                 const target = this.hapPushTargets.get(d.id) ?? { device: created?.instance ?? created, entries: [] }
-                target.entries.push({ service, characteristic: Characteristic, get: getterSetter.get })
+                target.entries.push({
+                  service,
+                  characteristic: Characteristic,
+                  get: getterSetter.get,
+                  readForHap,
+                })
                 this.hapPushTargets.set(d.id, target)
               }
               if (getterSetter && typeof getterSetter.set === 'function') {
@@ -493,11 +525,19 @@ export class SwitchBotHAPPlatform {
       this.log.debug?.(`Skipped pushing updates for ${id}:`, (e as Error)?.message)
       return
     }
-    for (const { service, characteristic, get } of target.entries) {
+    for (const { service, characteristic, get, readForHap } of target.entries) {
       try {
-        const value = await get()
-        if (value !== undefined && value !== null) {
-          service.getCharacteristic(characteristic).updateValue(value)
+        if (readForHap) {
+          await readForHap((value) => {
+            if (value !== undefined) {
+              service.getCharacteristic(characteristic).updateValue(value)
+            }
+          })
+        } else {
+          const value = await get()
+          if (value !== undefined && value !== null) {
+            service.getCharacteristic(characteristic).updateValue(value)
+          }
         }
       } catch (e) {
         this.log.debug?.(`Failed to push an update for ${id}:`, (e as Error)?.message)

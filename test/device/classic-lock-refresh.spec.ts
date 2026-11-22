@@ -98,18 +98,60 @@ describe('confirming classic Lock commands in HomeKit', () => {
     await vi.advanceTimersByTimeAsync(4000)
     expect(current.value).toBe(SECURED)
     expect(target.value).toBe(SECURED)
-    expect(getStatus).toHaveBeenCalledTimes(3)
+    expect(getStatus).toHaveBeenCalledTimes(4)
   })
 
-  it('stops after two unconfirmed reads and lets the next poll reconcile the target', async () => {
+  it('protects the target until 20 seconds even if no read confirms it', async () => {
     const { current, target, getStatus, poll } = await setup()
     await target.handleSetRequest(SECURED)
-    await vi.advanceTimersByTimeAsync(30_000)
-    expect(getStatus).toHaveBeenCalledTimes(2)
-
-    await poll()
+    await vi.advanceTimersByTimeAsync(19_999)
+    expect(getStatus).toHaveBeenCalledTimes(3)
+    expect(target.value).toBe(SECURED)
     expect(current.value).toBe(UNSECURED)
+
+    await vi.advanceTimersByTimeAsync(1)
     expect(target.value).toBe(UNSECURED)
+    expect(current.value).toBe(UNSECURED)
+
+    getStatus.mockResolvedValue(locked)
+    await poll()
+    expect(current.value).toBe(SECURED)
+    expect(target.value).toBe(SECURED)
+    expect(getStatus).toHaveBeenCalledTimes(4)
+  })
+
+  it.each([8000, 15_000])('confirms cloud availability at %i ms on the third read', async (availableAt) => {
+    const { current, target, getStatus } = await setup()
+    const startedAt = Date.now()
+    getStatus.mockImplementation(async () => Date.now() - startedAt >= availableAt
+      ? locked
+      : unlocked)
+
+    await target.handleSetRequest(SECURED)
+    await vi.advanceTimersByTimeAsync(15_999)
+    expect(getStatus).toHaveBeenCalledTimes(2)
+    expect(current.value).toBe(UNSECURED)
+    expect(target.value).toBe(SECURED)
+    await vi.advanceTimersByTimeAsync(1)
+    expect(getStatus).toHaveBeenCalledTimes(3)
+    expect(current.value).toBe(SECURED)
+    expect(target.value).toBe(SECURED)
+  })
+
+  it.each(['poll', 'HAP read'])('accepts a matching %s before the next scheduled read', async (source) => {
+    const { current, target, getStatus, poll } = await setup()
+    await target.handleSetRequest(SECURED)
+    await vi.advanceTimersByTimeAsync(8000)
+    getStatus.mockResolvedValue(locked)
+
+    if (source === 'poll') {
+      await poll()
+    } else {
+      await expect(target.handleGetRequest()).resolves.toBe(SECURED)
+    }
+    expect(current.value).toBe(SECURED)
+    expect(target.value).toBe(SECURED)
+    await vi.advanceTimersByTimeAsync(20_000)
     expect(getStatus).toHaveBeenCalledTimes(3)
   })
 
@@ -127,32 +169,37 @@ describe('confirming classic Lock commands in HomeKit', () => {
     expect(target.value).toBe(UNSECURED)
   })
 
-  it('lets polling recover after an unreadable confirmation', async () => {
+  it('keeps the target after an API error and accepts the next poll', async () => {
     const { current, target, getStatus, poll } = await setup()
     getStatus.mockRejectedValueOnce(new Error('offline')).mockResolvedValue(locked)
     await target.handleSetRequest(SECURED)
-    await vi.advanceTimersByTimeAsync(10_000)
+    await vi.advanceTimersByTimeAsync(2000)
     expect(getStatus).toHaveBeenCalledTimes(1)
+    expect(target.value).toBe(SECURED)
 
     await poll()
     expect(current.value).toBe(SECURED)
     expect(target.value).toBe(SECURED)
+    await vi.advanceTimersByTimeAsync(20_000)
+    expect(getStatus).toHaveBeenCalledTimes(2)
   })
 
-  it('resumes polling after the confirmation deadline and ignores the late response', async () => {
+  it('resumes polling after the deadline and ignores stalled responses', async () => {
     const { current, target, getStatus, poll } = await setup()
     const slowStatus = Promise.withResolvers<typeof locked>()
-    getStatus.mockReturnValueOnce(slowStatus.promise)
+    getStatus.mockReturnValue(slowStatus.promise)
     await target.handleSetRequest(SECURED)
-    await vi.advanceTimersByTimeAsync(10_001)
+    await vi.advanceTimersByTimeAsync(20_001)
+    expect(getStatus).toHaveBeenCalledTimes(3)
 
+    getStatus.mockResolvedValue(unlocked)
     await poll()
     expect(target.value).toBe(UNSECURED)
     slowStatus.resolve(locked)
     await vi.advanceTimersByTimeAsync(0)
     expect(current.value).toBe(UNSECURED)
     expect(target.value).toBe(UNSECURED)
-    expect(getStatus).toHaveBeenCalledTimes(2)
+    expect(getStatus).toHaveBeenCalledTimes(4)
   })
 
   it('does not let a pre-command poll overwrite a confirmed state', async () => {
@@ -172,6 +219,59 @@ describe('confirming classic Lock commands in HomeKit', () => {
     expect(target.value).toBe(SECURED)
     expect(await device.getState()).toEqual(locked)
     expect(getStatus).toHaveBeenCalledTimes(2)
+  })
+
+  it.each(['poll', 'HAP read'])('publishes no old %s result after a confirmation', async (source) => {
+    // Move the confirming response through the microtask turns between accepting
+    // the old API result, calculating its value and applying it to HAP.
+    for (let offset = 0; offset <= 20; offset++) {
+      const { current, target, getStatus, poll } = await setup()
+      const oldStatus = Promise.withResolvers<typeof unlocked>()
+      const confirmation = Promise.withResolvers<typeof locked>()
+      const currentChanges: number[] = []
+      const targetChanges: number[] = []
+      current.on('change', ({ oldValue, newValue }) => {
+        if (oldValue !== newValue) {
+          currentChanges.push(Number(newValue))
+        }
+      })
+      target.on('change', ({ oldValue, newValue }) => {
+        if (oldValue !== newValue) {
+          targetChanges.push(Number(newValue))
+        }
+      })
+
+      getStatus.mockReturnValueOnce(oldStatus.promise).mockReturnValueOnce(confirmation.promise)
+      await target.handleSetRequest(SECURED)
+      const reading = source === 'poll'
+        ? Promise.all([
+            poll(),
+            poll(),
+          ])
+        : Promise.all([
+            current.handleGetRequest(),
+            target.handleGetRequest(),
+          ])
+      await vi.advanceTimersByTimeAsync(2000)
+      expect(getStatus).toHaveBeenCalledTimes(2)
+
+      oldStatus.resolve(unlocked)
+      for (let turn = 0; turn < offset; turn++) {
+        await Promise.resolve()
+      }
+      confirmation.resolve(locked)
+      await reading
+      await vi.advanceTimersByTimeAsync(0)
+      expect(current.value, `microtask offset ${offset}`).toBe(SECURED)
+      expect(target.value, `microtask offset ${offset}`).toBe(SECURED)
+      expect(currentChanges, `microtask offset ${offset}`).toEqual([SECURED])
+      expect(targetChanges, `microtask offset ${offset}`).toEqual([SECURED])
+
+      await vi.advanceTimersByTimeAsync(16_000)
+      await poll()
+      expect(currentChanges).toEqual([SECURED, UNSECURED])
+      expect(targetChanges).toEqual([SECURED, UNSECURED])
+    }
   })
 
   it('ignores a late confirmation after a counter-command', async () => {
