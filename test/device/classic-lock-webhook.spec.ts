@@ -73,7 +73,8 @@ afterEach(async () => {
 
 async function receiver(resolve = vi.fn(() => vi.fn(async () => {}))) {
   const options = config()
-  const listener = startClassicLockWebhook(parseClassicLockWebhookConfig(options)!, resolve, vi.fn())
+  const debug = vi.fn()
+  const listener = startClassicLockWebhook(parseClassicLockWebhookConfig(options)!, resolve, vi.fn(), debug)
   cleanups.push(() => listener.close())
   await once(listener.server, 'listening')
   const { address, port } = listener.server.address() as AddressInfo
@@ -82,6 +83,7 @@ async function receiver(resolve = vi.fn(() => vi.fn(async () => {}))) {
     port,
     path: options.path,
     resolve,
+    debug,
   }
 }
 
@@ -194,13 +196,14 @@ describe('local classic Lock HTTP receiver', () => {
       await once(signal, 'abort')
       aborted()
     })
-    const { port, path } = await receiver(vi.fn(() => verify))
+    const { port, path, debug } = await receiver(vi.fn(() => verify))
     const now = Date.now()
     expect(await send(port, path, [
       body({ timeOfSample: now }),
     ])).toBe(202)
     await vi.waitFor(() => expect(verify).toHaveBeenCalledTimes(1), 1000)
     await vi.waitFor(() => expect(aborted).toHaveBeenCalledTimes(1), 6000)
+    expect(debug).toHaveBeenCalledWith(debug.mock.calls[0][0], 'discarded: timeout')
     expect(await send(port, path, [
       body({ timeOfSample: now + 1 }),
     ])).toBe(202)
@@ -214,7 +217,7 @@ describe('local classic Lock HTTP receiver', () => {
       firstSignal = signal
       await first.promise
     })
-    const { port, path } = await receiver(vi.fn(() => verify))
+    const { port, path, debug } = await receiver(vi.fn(() => verify))
     const now = Date.now()
     expect(await send(port, path, [
       body({ timeOfSample: now }),
@@ -226,6 +229,12 @@ describe('local classic Lock HTTP receiver', () => {
     expect(await send(port, path, [
       body({ timeOfSample: now + 2, lockState: 'JAMMED' }),
     ])).toBe(202)
+    const accepted = debug.mock.calls.filter(([, event]) => event === 'accepted; verification queued')
+    expect(accepted).toHaveLength(3)
+    expect(new Set(accepted.map(([id]) => id)).size).toBe(3)
+    for (const [id] of accepted.slice(0, 2)) {
+      expect(debug).toHaveBeenCalledWith(id, 'discarded: newer webhook event')
+    }
     expect(firstSignal?.aborted).toBe(true)
     expect(verify).toHaveBeenCalledTimes(1)
     first.resolve()
@@ -344,6 +353,8 @@ async function hapSetup({ enabled = true, verified = true } = {}) {
     post,
     poll,
     platform,
+    debug: log.debug,
+    path: options.path,
   }
 }
 
@@ -356,13 +367,50 @@ describe('verified classic Lock HAP publication', () => {
   })
 
   it('uses the independently read status instead of the hinted value and never sends a command', async () => {
-    const { post, current, target, setDeviceState, poll } = await hapSetup()
+    const { post, current, target, setDeviceState, poll, debug, path, verify } = await hapSetup()
     await poll()
     expect(current.value).toBe(SECURED)
     expect(await post({ lockState: 'LOCKED' })).toBe(202)
     await vi.waitFor(() => expect(current.value).toBe(UNSECURED))
     expect(target.value).toBe(UNSECURED)
     expect(setDeviceState).not.toHaveBeenCalled()
+    expect(verify).toHaveBeenCalledOnce()
+    const lines = debug.mock.calls.map(([message]) => message).filter(message => message.startsWith('[Classic Lock webhook '))
+    const prefix = lines[0].match(/^\[Classic Lock webhook [a-f0-9-]{36}\]/)?.[0]
+    expect(prefix).toBeDefined()
+    expect(lines).toEqual([
+      `${prefix} accepted; verification queued`,
+      `${prefix} OpenAPI status request started`,
+      `${prefix} OpenAPI status request succeeded`,
+      `${prefix} status confirmed`,
+    ])
+    for (const secret of [
+      path,
+      ID,
+      'test-token',
+      'test-secret',
+      'deviceMac',
+    ]) {
+      expect(lines.join(' ')).not.toContain(secret)
+    }
+  })
+
+  it('reports an unchanged status without an extra read', async () => {
+    const { post, poll, verify, debug } = await hapSetup()
+    await poll()
+    verify.mockResolvedValue(locked)
+    expect(await post()).toBe(202)
+    await vi.waitFor(() => expect(debug).toHaveBeenCalledWith(expect.stringMatching(/status unchanged$/)))
+    expect(verify).toHaveBeenCalledOnce()
+  })
+
+  it('logs a failed read without including the error detail', async () => {
+    const { post, verify, debug } = await hapSetup()
+    verify.mockRejectedValueOnce(new Error('private-transport-detail'))
+    expect(await post()).toBe(202)
+    await vi.waitFor(() => expect(debug).toHaveBeenCalledWith(expect.stringMatching(/OpenAPI status request failed$/)))
+    expect(JSON.stringify(debug.mock.calls)).not.toContain('private-transport-detail')
+    expect(verify).toHaveBeenCalledOnce()
   })
 
   it.each([
@@ -417,7 +465,7 @@ describe('verified classic Lock HAP publication', () => {
   })
 
   it('invalidates a verification started before a newer counter-command', async () => {
-    const { post, current, target, verify, poll, getLockInfo, setDeviceState } = await hapSetup()
+    const { post, current, target, verify, poll, getLockInfo, setDeviceState, debug } = await hapSetup()
     await target.handleSetRequest(SECURED)
     const slowVerification = Promise.withResolvers<typeof locked>()
     verify.mockReturnValueOnce(slowVerification.promise)
@@ -427,6 +475,7 @@ describe('verified classic Lock HAP publication', () => {
     await target.handleSetRequest(UNSECURED)
     slowVerification.resolve(locked)
     await new Promise(resolve => setImmediate(resolve))
+    expect(debug).toHaveBeenCalledWith(expect.stringMatching(/discarded: newer HomeKit command$/))
     expect(current.value).toBe(UNSECURED)
     expect(target.value).toBe(UNSECURED)
     expect(setDeviceState.mock.calls.map(([, command]) => command.command)).toEqual(['lock', 'unlock'])

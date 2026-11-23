@@ -33,6 +33,7 @@
  *
  * See README.md and docs for more details.
  */
+import type { WebhookDebug } from '../classicLockWebhook.js'
 import type { SwitchBotPluginConfig } from '../settings.js'
 
 import { Buffer } from 'node:buffer'
@@ -1652,26 +1653,57 @@ export class LockDevice extends GenericDevice {
       read: () => Promise<unknown>,
       isCurrent: () => boolean,
       publish: (current: number, target: number | undefined) => void,
+      debug: WebhookDebug,
     ) => {
       const revision = stateRevision
-      const state = await this.readRawLockStatus(read)
-      if (!isCurrent() || revision !== stateRevision) {
+      const startedForCommand = commandId
+      debug('OpenAPI status request started')
+      let state: Awaited<ReturnType<typeof this.readRawLockStatus>>
+      try {
+        state = await this.readRawLockStatus(read)
+      } catch (error) {
+        if (isCurrent()) {
+          debug('OpenAPI status request failed')
+        }
+        throw error
+      }
+      if (!isCurrent()) {
         return
       }
+      if (state === GenericDevice.UNREADABLE) {
+        debug('OpenAPI status request failed')
+      } else {
+        debug('OpenAPI status request succeeded')
+      }
+      if (revision !== stateRevision) {
+        debug(startedForCommand !== commandId
+          ? 'discarded: newer HomeKit command'
+          : 'discarded: newer status')
+        return
+      }
+      const previous = lastObserved
+      const previousTarget = targetValue()
       const observed = observe(state)
       if (observed === undefined) {
+        if (state !== GenericDevice.UNREADABLE) {
+          debug('discarded: newer status')
+        }
         return
       }
       const active = command
       if (active?.expiresAt !== undefined && active.confirmed === undefined
         && Date.now() < active.expiresAt && observed === active.target) {
         confirm(active, state, observed, 'webhook verification')
+        debug('status confirmed')
         if (active.publish) {
           return
         }
       } else {
         stateRevision++
         cacheObservation(state)
+        debug(previous === observed && previousTarget === targetValue()
+          ? 'status unchanged'
+          : 'status confirmed')
       }
       publish(observed, targetValue())
     }

@@ -1,7 +1,7 @@
 import type { ServerResponse } from 'node:http'
 
 import { Buffer } from 'node:buffer'
-import { createHash, timingSafeEqual } from 'node:crypto'
+import { createHash, randomUUID, timingSafeEqual } from 'node:crypto'
 import { createServer } from 'node:http'
 
 export interface ClassicLockWebhookConfig {
@@ -11,7 +11,23 @@ export interface ClassicLockWebhookConfig {
   deviceIds?: string[]
 }
 
-type VerifyLock = (signal: AbortSignal, expiresAt: number) => Promise<void>
+type WebhookDebugEvent
+  = | 'accepted; verification queued'
+    | 'OpenAPI status request started'
+    | 'OpenAPI status request succeeded'
+    | 'OpenAPI status request failed'
+    | 'status confirmed'
+    | 'status unchanged'
+    | 'discarded: daily verification limit'
+    | 'discarded: timeout'
+    | 'discarded: newer webhook event'
+    | 'discarded: newer HomeKit command'
+    | 'discarded: newer status'
+    | 'discarded: lock no longer available'
+    | 'discarded: listener stopped'
+
+export type WebhookDebug = (event: WebhookDebugEvent) => void
+type VerifyLock = (signal: AbortSignal, expiresAt: number, debug: WebhookDebug) => Promise<void>
 
 const BODY_LIMIT = 4096
 const HTTP_TIMEOUT_MS = 2000
@@ -98,8 +114,8 @@ function decodeEvent(body: string) {
 interface Verification {
   lastSample: number
   nextAt: number
-  queued?: VerifyLock
-  inFlight?: AbortController
+  queued?: { verify: VerifyLock, debug: WebhookDebug }
+  inFlight?: { controller: AbortController, debug: WebhookDebug }
   timer?: NodeJS.Timeout
 }
 
@@ -107,6 +123,7 @@ export function startClassicLockWebhook(
   config: NonNullable<ReturnType<typeof parseClassicLockWebhookConfig>>,
   resolve: (id: string) => VerifyLock | undefined,
   onError: () => void,
+  logDebug?: (correlationId: string, event: WebhookDebugEvent) => void,
 ) {
   const pathDigest = createHash('sha256').update(config.path).digest()
   const devices = new Map<string, Verification>()
@@ -122,21 +139,30 @@ export function startClassicLockWebhook(
     lock.timer = setTimeout(async () => {
       lock.timer = undefined
       const now = Date.now()
-      const verify = lock.queued
+      const job = lock.queued
       lock.queued = undefined
       while (verificationTimes.length && verificationTimes[0] <= now - DAY_MS) {
         verificationTimes.shift()
       }
-      if (stopped || !verify || verificationTimes.length >= VERIFY_DAILY_LIMIT) {
+      if (stopped || !job) {
+        return
+      }
+      if (verificationTimes.length >= VERIFY_DAILY_LIMIT) {
+        job.debug('discarded: daily verification limit')
         return
       }
       verificationTimes.push(now)
       lock.nextAt = now + VERIFY_INTERVAL_MS
       const controller = new AbortController()
-      lock.inFlight = controller
-      const deadline = setTimeout(() => controller.abort(), VERIFY_TIMEOUT_MS)
+      lock.inFlight = { controller, debug: job.debug }
+      const deadline = setTimeout(() => {
+        if (!controller.signal.aborted) {
+          job.debug('discarded: timeout')
+        }
+        controller.abort()
+      }, VERIFY_TIMEOUT_MS)
       try {
-        await verify(controller.signal, now + VERIFY_TIMEOUT_MS)
+        await job.verify(controller.signal, now + VERIFY_TIMEOUT_MS, job.debug)
       } catch {
         // Neither transport errors nor request data belong in the listener logs.
       } finally {
@@ -234,8 +260,15 @@ export function startClassicLockWebhook(
       }
       devices.set(event.id, lock)
       lock.lastSample = event.time
-      lock.inFlight?.abort()
-      lock.queued = verify
+      if (lock.inFlight && !lock.inFlight.controller.signal.aborted) {
+        lock.inFlight.debug('discarded: newer webhook event')
+        lock.inFlight.controller.abort()
+      }
+      lock.queued?.debug('discarded: newer webhook event')
+      const correlationId = randomUUID()
+      const debug: WebhookDebug = event => logDebug?.(correlationId, event)
+      lock.queued = { verify, debug }
+      debug('accepted; verification queued')
       schedule(lock)
       respond(res, 202)
     })
@@ -252,7 +285,11 @@ export function startClassicLockWebhook(
       stopped = true
       for (const lock of devices.values()) {
         clearTimeout(lock.timer)
-        lock.inFlight?.abort()
+        if (lock.inFlight && !lock.inFlight.controller.signal.aborted) {
+          lock.inFlight.debug('discarded: listener stopped')
+          lock.inFlight.controller.abort()
+        }
+        lock.queued?.debug('discarded: listener stopped')
         lock.queued = undefined
       }
       devices.clear()

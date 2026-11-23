@@ -1,3 +1,4 @@
+import type { WebhookDebug } from './classicLockWebhook.js'
 import type { SwitchBotPluginConfig } from './settings.js'
 import type { API, Logger, PlatformConfig } from 'homebridge'
 
@@ -13,6 +14,7 @@ interface WebhookLockTarget {
     read: () => Promise<unknown>,
     isCurrent: () => boolean,
     publish: (current: number, target: number | undefined) => void,
+    debug: WebhookDebug,
   ) => Promise<void>
   publish: (current: number, target: number | undefined) => void
 }
@@ -535,15 +537,31 @@ export class SwitchBotHAPPlatform {
       if (!target || !client?.getClassicLockWebhookReader?.(target.id)) {
         return
       }
-      return async (signal, expiresAt) => {
-        const isCurrent = () => !signal.aborted && Date.now() < expiresAt
-          && !this.webhookStopped && this.webhookTargets.get(id) === target
+      return async (signal, expiresAt, debug) => {
+        const isCurrent = () => {
+          if (signal.aborted) {
+            return false
+          }
+          if (Date.now() >= expiresAt) {
+            debug('discarded: timeout')
+            return false
+          }
+          if (this.webhookStopped || this.webhookTargets.get(id) !== target) {
+            debug('discarded: lock no longer available')
+            return false
+          }
+          return true
+        }
         const read = client.getClassicLockWebhookReader(target.id)
         if (read && isCurrent()) {
-          await target.verify(() => read(signal), isCurrent, target.publish)
+          await target.verify(() => read(signal), isCurrent, target.publish, debug)
+        } else if (!read && !signal.aborted) {
+          debug('discarded: lock no longer available')
         }
       }
-    }, () => this.log.warn('Classic Lock webhook listener error'))
+    }, () => this.log.warn('Classic Lock webhook listener error'), (correlationId, event) => {
+      this.log.debug(`[Classic Lock webhook ${correlationId}] ${event}`)
+    })
   }
 
   /**
